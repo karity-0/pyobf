@@ -36,9 +36,10 @@ class Pipeline:
     Input scripts are never executed.
     """
 
-    def __init__(self, *, strip_info: bool = True) -> None:
+    def __init__(self, *, strip_info: bool = True, preserve_module_names: bool = False) -> None:
         self._pre_passes: list[PrePass] = [StringEncryptionPass(), ProtectionPass()]
         self._passes: list[BasePass] = [StripInfoPass()] if strip_info else []
+        self._preserve_module_names = preserve_module_names
 
     def add(self, pass_: BasePass | PrePass) -> Pipeline:
         if isinstance(pass_, PrePass):
@@ -54,8 +55,13 @@ class Pipeline:
             source = SourceDocument(source)
         applied: list[str] = []
         records: list[PassRecord] = []
+        preserve_names = False
+        seals = []
         for pass_ in self._pre_passes:
             edits = tuple(pass_.run(source))
+            preserve_names |= getattr(pass_, "preserve_names", False)
+            if getattr(pass_, 'integrity', None) is not None:
+                seals.append(pass_.integrity)
             source = source.with_text(apply_replacements(source.text, edits))
             if edits:
                 name = type(pass_).__name__
@@ -63,12 +69,19 @@ class Pipeline:
                 records.append(PassRecord(name, len(edits)))
         context = analyze(source)
         for pass_ in self._passes:
-            edits = tuple(pass_.run(context))
+            edits = tuple(pass_.run(context, preserve_names=preserve_names, preserve_module_names=True)
+                          if isinstance(pass_, StripInfoPass) and self._preserve_module_names
+                          else pass_.run(context, preserve_names=preserve_names) if isinstance(pass_, StripInfoPass) else pass_.run(context))
             source = source.with_text(apply_replacements(source.text, edits))
             context = analyze(source)
             name = type(pass_).__name__
             applied.append(name)
             records.append(PassRecord(name, len(edits)))
+        for seal in seals:
+            source = seal.seal(source)
+            context = analyze(source)
+            applied.append('IntegrityPass')
+            records.append(PassRecord('IntegrityPass', 1))
         return PipelineResult(source, context, tuple(applied), tuple(records))
 
     @staticmethod

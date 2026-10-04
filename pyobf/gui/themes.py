@@ -49,7 +49,8 @@ def palette(theme: Theme) -> QPalette:
     return result
 
 
-def stylesheet(t: Theme) -> str:
+def stylesheet(t: Theme, design='studio') -> str:
+    from .designs import design_stylesheet
     background = t.background if not t.gradient else f"qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {t.background},stop:1 {t.gradient})"
     return f"""
     QMainWindow, QDialog, QWidget#root {{ background: {background}; color: {t.text}; }}
@@ -77,6 +78,10 @@ def stylesheet(t: Theme) -> str:
     QLineEdit, QComboBox {{ background: {t.raised}; border: 1px solid {t.border}; border-radius: 7px; padding: 8px; }}
     QLineEdit:focus, QComboBox:focus {{ border-color: {t.accent}; }}
     QComboBox QAbstractItemView {{ background: {t.surface}; selection-background-color: {t.selection}; }}
+    QTabWidget::pane {{ border: none; background: transparent; }}
+    QTabBar::tab {{ background: {t.raised}; border: none; border-radius: 9px; padding: 9px 18px; margin-right: 6px; }}
+    QTabBar::tab:selected {{ background: {t.accent}; color: {t.surface}; }}
+    QTabBar::tab:hover:!selected {{ background: {t.selection}; }}
     QSplitter::handle {{ background: transparent; }}
     QScrollBar:vertical {{ background: transparent; width: 9px; margin: 2px; }}
     QScrollBar::handle:vertical {{ background: {t.border}; border-radius: 4px; min-height: 25px; }}
@@ -85,4 +90,4 @@ def stylesheet(t: Theme) -> str:
     QScrollBar::add-line, QScrollBar::sub-line {{ width: 0px; height: 0px; }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
     QToolTip {{ background: {t.surface}; color: {t.text}; border: 1px solid {t.border}; padding: 6px; }}
-    """
+    """ + design_stylesheet(design, t)

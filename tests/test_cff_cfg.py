@@ -386,7 +386,9 @@ class BasicBlockCffTests(unittest.TestCase):
                 return values
         ''')
         result = self.compare(script, lambda ns: ns['f']())
-        self.assertEqual(sum(isinstance(n, ast.For) for n in ast.walk(ast.parse(result.source.text))), 2)
+        # Count the original range loops, excluding BCF's private literal scans.
+        self.assertEqual(sum(isinstance(n, ast.For) and isinstance(n.iter, ast.Call)
+                             for n in ast.walk(ast.parse(result.source.text))), 2)
 
     def test_no_generated_helpers_remain_in_class_namespace(self):
         script = source('''

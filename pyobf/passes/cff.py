@@ -83,7 +83,7 @@ class ControlFlowFlatteningPass(BlockPass):
     around next(), never around user target assignment or the original loop body.
     """
 
-    def run(self, statements: list[ast.stmt], names: NameAllocator) -> list[ast.stmt]:
+    def run(self, statements: list[ast.stmt], names: NameAllocator, *, builtin_proxy=None, morph=False) -> list[ast.stmt]:
         if not statements:
             return [ast.Pass()]
         statements = copy.deepcopy(statements)
@@ -91,6 +91,8 @@ class ControlFlowFlatteningPass(BlockPass):
         statements = [declarations.visit(statement) for statement in statements]
         graph = ControlFlowGraph(names)
         entry = graph.lower(statements)
+        if morph:
+            graph.unroll()
         state = names.new()
         labels = dict(zip(graph.blocks, names.random.sample(range(1, 1 << 30), len(graph.blocks))))
         labels[0] = 0
@@ -159,9 +161,12 @@ class ControlFlowFlatteningPass(BlockPass):
             output.append(assign(graph.control, ast.Constant(0)))
         protected = []
         if graph.helpers:
-            protected.append(ast.ImportFrom(
-                module='builtins', names=[ast.alias(name=name, asname=alias) for name, alias in graph.helpers.items()], level=0,
-            ))
+            if builtin_proxy is None:
+                protected.append(ast.ImportFrom(
+                    module='builtins', names=[ast.alias(name=name, asname=alias) for name, alias in graph.helpers.items()], level=0,
+                ))
+            else:
+                protected.extend(assign(alias, builtin_proxy.expression(name, builtin_only=True)) for name, alias in graph.helpers.items())
         protected.append(ast.While(
             test=ast.Compare(left=ast.Name(id=state, ctx=ast.Load()), ops=[ast.NotEq()], comparators=[ast.Constant(0)]),
             body=dispatch(leaves), orelse=[],

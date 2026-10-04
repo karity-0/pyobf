@@ -3,17 +3,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QSize, Qt, QThread, Slot
+from PySide6.QtCore import QDir, QSize, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QKeySequence, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFileSystemModel, QFrame, QHBoxLayout, QLabel,
+    QApplication, QFileDialog, QFileSystemModel, QBoxLayout, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit, QSplitter, QToolButton, QTreeView, QVBoxLayout, QWidget,
+    QPlainTextEdit, QSizePolicy, QSplitter, QToolButton, QTreeView, QVBoxLayout, QWidget,
 )
 
 from .. import __version__
 from ..pipeline import Pipeline, PipelineResult
 from ..source import SourceDocument
+from ..project import build_project, validate_destination, ProjectCancelled
 from .editor import CodeEditor
 from .i18n import diagnostic, tr
 from .icons import make_icon
@@ -41,12 +42,33 @@ class AnalysisWorker(QThread):
             self.error = f"{type(error).__name__}: {error}"
 
 
+class ProjectWorker(QThread):
+    progress = Signal(int, int, str)
+
+    def __init__(self, source, destination, parent=None, *, documents=()):
+        super().__init__(parent)
+        self.source, self.destination = source, destination
+        self.documents = documents
+        self.result = self.error = None
+        self.cancelled = False
+
+    def run(self):
+        try:
+            self.result = build_project(self.source, self.destination, progress=self.progress.emit,
+                                        cancelled=self.isInterruptionRequested, documents=self.documents)
+        except ProjectCancelled:
+            self.cancelled = True
+        except Exception as error:
+            self.error = str(error)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings=None):
         super().__init__()
         self.settings = settings if settings is not None else SettingsStore()
         self.language = self.settings.data["language"]
         self.theme_key = self.settings.data["theme"]
+        self.design_key = self.settings.data["design"]
         self.theme = THEMES[self.theme_key]
         self._loaded = SourceDocument("")
         self._loaded_display = ""
@@ -55,6 +77,7 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._run_after_build = False
         self._project = None
+        self._project_result = None
         self._closing = False
         self._status_key = "ready"
         self._status_values = {}
@@ -101,26 +124,35 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root.setObjectName("root")
         layout = QVBoxLayout(root)
+        self.root_layout = layout
         layout.setContentsMargins(22, 18, 22, 12)
         layout.setSpacing(16)
-        header = QHBoxLayout()
+        self.toolbar = QFrame()
+        self.toolbar.setObjectName("toolbar")
+        header = QHBoxLayout(self.toolbar)
+        header.setContentsMargins(0, 0, 0, 0)
+        self.header_layout = header
         header.setSpacing(10)
         self.sidebar_button = self._button("sidebar", "sidebar", "Ctrl+B", self.toggle_sidebar)
         header.addWidget(self.sidebar_button)
         brand = QLabel("pyobf")
+        self.brand = brand
         brand.setObjectName("brand")
         header.addWidget(brand)
         version = QLabel(__version__)
+        self.version_badge = version
         version.setObjectName("version")
         header.addWidget(version)
         header.addStretch()
+        self.header_spacer = header.itemAt(header.count() - 1).spacerItem()
         self.open_button = self._button("open", "open", "Ctrl+O", self.open_source)
         self.project_button = self._button("project", "project_open", "Ctrl+Shift+O", self.open_project)
         self.run_button = self._button("run", "build", "Ctrl+Return", self.process_source, True)
+        self.project_run_button = self._button("project_run", "build_project", "Ctrl+Shift+Return", self.process_project, True)
         self.pref_button = self._button("settings", "preferences", "Ctrl+,", self.open_preferences)
-        for button in (self.open_button, self.project_button, self.run_button, self.pref_button):
+        for button in (self.open_button, self.project_button, self.run_button, self.project_run_button, self.pref_button):
             header.addWidget(button)
-        layout.addLayout(header)
+        layout.addWidget(self.toolbar)
 
         self.sidebar = QFrame()
         self.sidebar.setObjectName("sidebar")
@@ -174,6 +206,7 @@ class MainWindow(QMainWindow):
         self.save_button = self._button("save", "save", "Ctrl+Shift+S", self.save_output)
         self.output_play_button = self._button("play", "run_output", "Shift+F5", self.execute_output)
         editors = QSplitter(Qt.Orientation.Horizontal)
+        self.editors_splitter = editors
         editors.setHandleWidth(14)
         editors.setChildrenCollapsible(False)
         editors.addWidget(self._panel("input", self.input_subject, self.input, [self.input_save_button, self.input_play_button]))
@@ -181,6 +214,7 @@ class MainWindow(QMainWindow):
         editors.setSizes([520, 520])
 
         console_card = QFrame()
+        self.console_card = console_card
         console_card.setObjectName("console")
         console_card.setMinimumHeight(180)
         console_layout = QVBoxLayout(console_card)
@@ -193,7 +227,7 @@ class MainWindow(QMainWindow):
         console_header.addWidget(self.execution_label)
         console_header.addStretch()
         self.clear_button = self._button("clear", "clear", "", self.clear_console)
-        self.stop_button = self._button("stop", "stop", "Shift+F6", self.runner.stop)
+        self.stop_button = self._button("stop", "cancel_work", "Shift+F6", self.stop_work)
         console_header.addWidget(self.clear_button)
         console_header.addWidget(self.stop_button)
         console_layout.addLayout(console_header)
@@ -206,25 +240,33 @@ class MainWindow(QMainWindow):
         self.stdin.returnPressed.connect(self.send_stdin)
         console_layout.addWidget(self.stdin)
         work = QSplitter(Qt.Orientation.Vertical)
+        self.work_splitter = work
         work.setHandleWidth(14)
         work.setChildrenCollapsible(False)
         work.addWidget(editors)
         work.addWidget(console_card)
         work.setSizes([490, 220])
         workspace = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter = workspace
         workspace.setHandleWidth(16)
         workspace.setChildrenCollapsible(False)
         workspace.addWidget(self.sidebar)
         workspace.addWidget(work)
         workspace.setStretchFactor(1, 1)
         workspace.setSizes([214, 1060])
-        layout.addWidget(workspace, 1)
+        self.stage = QWidget()
+        self.stage_layout = QHBoxLayout(self.stage)
+        self.stage_layout.setContentsMargins(0, 0, 0, 0)
+        self.stage_layout.setSpacing(14)
+        self.stage_layout.addWidget(workspace, 1)
+        layout.addWidget(self.stage, 1)
         footer = QHBoxLayout()
         self.status = QLabel()
         self.status.setObjectName("muted")
         footer.addWidget(self.status)
         footer.addStretch()
         info = QLabel(f"Python {sys.version_info.major}.{sys.version_info.minor}  ·  UTF-8")
+        self.runtime_info = info
         info.setObjectName("muted")
         footer.addWidget(info)
         layout.addLayout(footer)
@@ -260,7 +302,9 @@ class MainWindow(QMainWindow):
         self.theme = THEMES[self.theme_key]
         self.setPalette(palette(self.theme))
         QApplication.instance().setPalette(palette(self.theme))
-        self.setStyleSheet(stylesheet(self.theme))
+        self.setStyleSheet(stylesheet(self.theme, self.design_key))
+        if getattr(self, '_applied_design', None) != self.design_key:
+            self.apply_design()
         for editor in (self.input, self.output):
             editor.set_theme(self.theme)
         if old_theme != self.theme:
@@ -272,6 +316,50 @@ class MainWindow(QMainWindow):
             cursor.movePosition(QTextCursor.MoveOperation.End)
             self.console.setTextCursor(cursor)
         self.retranslate()
+
+    def apply_design(self):
+        focus, orbit = self.design_key == 'focus', self.design_key == 'orbit'
+        self.root_layout.removeWidget(self.toolbar)
+        self.stage_layout.removeWidget(self.toolbar)
+        self.toolbar.setMinimumWidth(0)
+        self.toolbar.setMaximumWidth(64 if focus else 16777215)
+        self.header_layout.setDirection(QBoxLayout.Direction.TopToBottom if focus else QBoxLayout.Direction.LeftToRight)
+        self.header_layout.setContentsMargins(*( (8, 12, 8, 12) if focus else (18, 10, 18, 10) if orbit else (0, 0, 0, 0)))
+        self.header_layout.setSpacing(10)
+        self.header_spacer.changeSize(0, 0, QSizePolicy.Policy.Fixed if focus or orbit else QSizePolicy.Policy.Expanding,
+                                      QSizePolicy.Policy.Fixed)
+        self.header_layout.invalidate()
+        if focus:
+            self.stage_layout.insertWidget(0, self.toolbar, 0, Qt.AlignmentFlag.AlignTop)
+        elif orbit:
+            self.root_layout.insertWidget(1, self.toolbar, 0, Qt.AlignmentFlag.AlignHCenter)
+        else:
+            self.root_layout.insertWidget(0, self.toolbar)
+        self.brand.setVisible(not focus)
+        self.version_badge.setVisible(not focus and not orbit)
+        self.runtime_info.setVisible(not focus and not orbit)
+        self.editors_splitter.setOrientation(Qt.Orientation.Vertical if focus else Qt.Orientation.Horizontal)
+        self.work_splitter.setOrientation(Qt.Orientation.Horizontal if focus else Qt.Orientation.Vertical)
+        self.workspace_splitter.insertWidget(1 if orbit else 0, self.sidebar)
+        self.workspace_splitter.setStretchFactor(0, 1 if orbit else 0)
+        self.workspace_splitter.setStretchFactor(1, 0 if orbit else 1)
+        self.workspace_splitter.setSizes([1060, 214] if orbit else [214, 1060])
+        self.editors_splitter.setSizes([520, 520])
+        self.work_splitter.setSizes([740, 300] if focus else [490, 220])
+        for index in range(self.editors_splitter.count()):
+            panel_layout = self.editors_splitter.widget(index).layout()
+            margin = 20 if orbit else 12
+            panel_layout.setContentsMargins(margin, margin, margin, margin)
+        for button, _, _, _, primary in self._buttons:
+            if focus or orbit:
+                size = 56 if orbit and primary else 44 if orbit else 40
+                button.setFixedSize(size, size)
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            else:
+                button.setMinimumSize(0, 0)
+                button.setMaximumSize(16777215, 16777215)
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon if primary else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._applied_design = self.design_key
 
     def retranslate(self):
         for label, key in self._labels:
@@ -300,19 +388,24 @@ class MainWindow(QMainWindow):
         self.refresh_recents()
         self._refresh_status()
 
-    def set_preferences(self, theme, language):
+    def set_preferences(self, theme, language, design=None):
         try:
-            self.settings.preferences(theme, language)
+            self.settings.preferences(theme, language, design)
         except OSError as error:
             QMessageBox.warning(self, self.text("settings_failed"), str(error))
             return
         self.theme_key, self.language = theme, language
+        self.design_key = self.settings.data['design']
         self.apply_appearance()
+
+    def set_design(self, design):
+        self.set_preferences(self.theme_key, self.language, design)
 
     @Slot()
     def open_preferences(self):
         dialog = PreferencesDialog(self.theme_key, self.language, self)
         dialog.changed.connect(self.set_preferences)
+        dialog.design_changed.connect(self.set_design)
         dialog.exec()
         dialog.deleteLater()
 
@@ -455,7 +548,7 @@ class MainWindow(QMainWindow):
     def _update_controls(self):
         busy = self._thread is not None or self.runner.running
         self.input.setReadOnly(self._thread is not None)
-        for button in (self.open_button, self.project_button, self.run_button, self.input_play_button, self.input_save_button):
+        for button in (self.open_button, self.project_button, self.run_button, self.project_run_button, self.input_play_button, self.input_save_button):
             self._enabled(button, not busy)
         self.tree.setEnabled(not busy)
         self.recent_files.setEnabled(not busy)
@@ -464,7 +557,7 @@ class MainWindow(QMainWindow):
         self._enabled(self.copy_button, available)
         self._enabled(self.save_button, available)
         self._enabled(self.output_play_button, available and not busy)
-        self._enabled(self.stop_button, self.runner.running)
+        self._enabled(self.stop_button, self.runner.running or isinstance(self._thread, ProjectWorker))
         self.stdin.setEnabled(self.runner.running)
 
     @Slot()
@@ -501,6 +594,75 @@ class MainWindow(QMainWindow):
     @Slot()
     def process_source(self):
         self._start_build(False)
+
+    @Slot()
+    def process_project(self):
+        if self._thread is not None or self.runner.running:
+            return
+        if self._project is None:
+            self.open_project()
+        if self._project is None:
+            return
+        parent = QFileDialog.getExistingDirectory(self, self.text('output_parent'), str(self._project.parent))
+        if parent:
+            self.start_project_build(parent)
+
+    def start_project_build(self, parent):
+        if self._thread is not None or self.runner.running or self._project is None:
+            return False
+        try:
+            source, destination = validate_destination(self._project, parent)
+        except (ValueError, OSError) as error:
+            QMessageBox.warning(self, self.text('project_build_failed'), self.text(str(error)))
+            return False
+        self._project_result = None
+        self.console.clear()
+        self.execution_label.setText(self.text('build_project'))
+        self.set_status('analyzing')
+        document = self._input_source()
+        documents = ()
+        if not document.filename.startswith('<') and source in Path(document.filename).resolve().parents:
+            documents = (document,)
+        self._thread = ProjectWorker(source, destination, self, documents=documents)
+        self._thread.progress.connect(self._project_progress, Qt.ConnectionType.QueuedConnection)
+        self._thread.finished.connect(self._finish_project, Qt.ConnectionType.QueuedConnection)
+        self._update_controls()
+        self._thread.start()
+        return True
+
+    @Slot(int, int, str)
+    def _project_progress(self, done, total, file):
+        if isinstance(self._thread, ProjectWorker):
+            self.set_status('project_progress', done=done, total=total, file=file)
+
+    @Slot()
+    def _finish_project(self):
+        thread = self._thread
+        if not isinstance(thread, ProjectWorker):
+            return
+        self._thread = None
+        try:
+            if thread.result is not None:
+                self._project_result = thread.result
+                self.set_status('project_done', count=thread.result.scripts, path=str(thread.result.output))
+                self._append_console(self.status.text() + '\n')
+            elif thread.cancelled:
+                self.set_status('project_cancelled')
+                self._append_console(self.status.text() + '\n', muted=True)
+            else:
+                self.set_status('project_build_failed')
+                message = diagnostic(self.text(thread.error or 'project_build_failed'), self.language)
+                self._append_console(message + '\n', True)
+                QMessageBox.warning(self, self.text('project_build_failed'), message)
+        finally:
+            self._update_controls()
+            thread.deleteLater()
+
+    @Slot()
+    def stop_work(self):
+        if isinstance(self._thread, ProjectWorker):
+            self._thread.requestInterruption()
+        self.runner.stop()
 
     def _start_build(self, execute):
         if self._thread is not None or self.runner.running:

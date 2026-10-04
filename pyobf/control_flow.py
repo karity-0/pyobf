@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 from dataclasses import dataclass, field
 
 from .names import NameAllocator
@@ -93,6 +94,7 @@ class ControlFlowGraph:
         self.temporaries: list[str] = []
         self.control = names.new()
         self.external_exits: dict[bool, int] = {}
+        self.loops: list[tuple[int, set[int]]] = []
 
     def reserve(self) -> int:
         key = len(self.blocks) + 1
@@ -139,8 +141,10 @@ class ControlFlowGraph:
         if isinstance(node, ast.While):
             head = self.reserve()
             exhausted = self.lower(node.orelse, following, loop)
+            before = set(self.blocks)
             body = self.lower(node.body, head, LoopTargets(following, head))
             self.blocks[head] = BasicBlock([], Branch(node.test, body, exhausted))
+            self.loops.append((head, set(self.blocks) - before))
             return head
         if isinstance(node, (ast.For, ast.AsyncFor)):
             asynchronous = isinstance(node, ast.AsyncFor)
@@ -152,8 +156,10 @@ class ControlFlowGraph:
             release = [assign(iterator, ast.Constant(None))]
             exhausted = self.block(release, Jump(otherwise))
             broken = self.block([assign(iterator, ast.Constant(None))], Jump(following))
+            before = set(self.blocks)
             body = self.lower(node.body, head, LoopTargets(broken, head))
             self.blocks[head] = BasicBlock([], IteratorNext(iterator, value, node.target, body, exhausted, asynchronous))
+            self.loops.append((head, set(self.blocks) - before))
             prepare = assign(iterator, ast.Call(
                 func=ast.Name(id=self.helper('aiter' if asynchronous else 'iter'), ctx=ast.Load()),
                 args=[node.iter], keywords=[],
@@ -170,3 +176,54 @@ class ControlFlowGraph:
             self.exit_target(loop, False) if finder.continuing else loop.continuing,
         )
         return self.block([node], Jump(following), targets, finder.breaking or finder.continuing)
+
+    def unroll(self, *, max_blocks=384, max_added=192, max_added_nodes=4096) -> None:
+        """Clone loop lanes, retaining every test/next and native exit boundary.
+
+        Work from outer loops to inner ones. Inner lane expansion is optional;
+        cloned inner loops already retain all of their native graph edges.
+        """
+        added = 0
+        added_nodes = 0
+        for head, body in reversed(self.loops):
+            selected = body | {head}
+            lanes = self.names.random.choice((2, 3))
+            cost = len(selected) * (lanes - 1)
+            weight = 0
+            for key in selected:
+                block = self.blocks[key]
+                nodes = list(block.statements)
+                if isinstance(block.terminator, Branch):
+                    nodes.append(block.terminator.test)
+                elif isinstance(block.terminator, IteratorNext):
+                    nodes.append(block.terminator.target)
+                weight += sum(sum(1 for _ in ast.walk(node)) for node in nodes) + 1
+            node_cost = weight * (lanes - 1)
+            if cost + added > max_added or cost + len(self.blocks) > max_blocks or node_cost + added_nodes > max_added_nodes:
+                continue
+            originals = {key: copy.deepcopy(self.blocks[key]) for key in selected}
+            mappings = [{key: key for key in selected}]
+            for _ in range(lanes - 1):
+                mappings.append({key: self.reserve() for key in sorted(selected)})
+            for lane, mapping in enumerate(mappings):
+                def target(key):
+                    if key == head:
+                        return mappings[(lane + 1) % lanes][head]
+                    return mapping.get(key, key)
+
+                for key, original in originals.items():
+                    block = copy.deepcopy(original)
+                    term = block.terminator
+                    if isinstance(term, Jump):
+                        block.terminator = Jump(target(term.target))
+                    elif isinstance(term, Branch):
+                        block.terminator = Branch(term.test, target(term.yes), target(term.no))
+                    else:
+                        block.terminator = IteratorNext(
+                            term.iterator, term.value, term.target,
+                            target(term.body), target(term.exhausted), term.asynchronous,
+                        )
+                    block.loop = LoopTargets(target(block.loop.breaking), target(block.loop.continuing))
+                    self.blocks[mapping[key]] = block
+            added += cost
+            added_nodes += node_cost

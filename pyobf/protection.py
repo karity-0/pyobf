@@ -65,9 +65,9 @@ def find_protection_regions(source: SourceDocument) -> tuple[ProtectionRegion, .
             except SyntaxError:
                 raise marker_error(source, marker, "@protect_start(cff, junk) 형식으로 써야 합니다") from None
             if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.func.id != "protect_start" or call.keywords or not call.args:
-                raise marker_error(source, marker, "protect 옵션으로 cff 또는 junk를 지정하세요")
-            if any(not isinstance(arg, ast.Name) or arg.id not in {"cff", "junk"} for arg in call.args):
-                raise marker_error(source, marker, "지원하는 protect 옵션은 cff, junk입니다")
+                raise marker_error(source, marker, "protect 옵션으로 cff, bcf, junk, proxy, morph 또는 integrity를 지정하세요")
+            if any(not isinstance(arg, ast.Name) or arg.id not in {"cff", "bcf", "junk", "proxy", "morph", "integrity"} for arg in call.args):
+                raise marker_error(source, marker, "지원하는 protect 옵션은 cff, bcf, junk, proxy, morph, integrity입니다")
             options = tuple(arg.id for arg in call.args)
             if len(set(options)) != len(options):
                 raise marker_error(source, marker, "protect 옵션이 중복되었습니다")

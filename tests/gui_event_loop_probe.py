@@ -20,7 +20,7 @@ def main():
     settings_directory = tempfile.TemporaryDirectory()
     window = MainWindow(SettingsStore(Path(settings_directory.name) / "preferences.json"))
     plain = 'print("hello world")\nx= "hi"'
-    protected = 'def f(n):\n    @protect_start(cff, junk)\n    x = n + 1\n    for i in range(4):\n        if i % 2:\n            continue\n        x += i\n    x *= 2\n    @protect_end\n    return x\n'
+    protected = 'def f(n):\n    @protect_start(cff, bcf, junk, proxy, morph, integrity)\n    x = n + 1\n    for i in range(4):\n        if i % 2:\n            continue\n        x += i + ord("A") - 65\n    x *= 2\n    @protect_end\n    return x\n'
     jobs = [plain, 'x = @{"hello world"}', protected, "x = ("] * 10
     index = 0
     pending = False
@@ -88,10 +88,12 @@ def main():
                     assert "hello world" not in window.output.toPlainText()
                 elif source == protected:
                     assert window._result is not None
-                    assert window._result.applied_passes == ("ProtectionPass", "StripInfoPass")
+                    assert window._result.applied_passes == ("ProtectionPass", "StripInfoPass", "IntegrityPass")
                     assert "@protect_" not in window.output.toPlainText()
                     namespace = {}
-                    exec(window.output.toPlainText(), namespace)
+                    sealed = Path(settings_directory.name) / 'sealed.py'
+                    sealed.write_bytes(window._result.source.to_bytes())
+                    exec(compile(sealed.read_bytes(), str(sealed), 'exec'), namespace)
                     assert namespace["f"](4) == 14
                 else:
                     assert window._result is None

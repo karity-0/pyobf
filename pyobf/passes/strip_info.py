@@ -44,7 +44,9 @@ class Resolver(ast.NodeVisitor):
         self.scopes = [self.root]
         self.functions = []
         self.names = {}  # AST Name -> lexical binding (including comprehension captures).
+        self.name_scopes = {}
         self.annotation_names = set()
+        self.annotation_nodes = set()
 
     def binding(self, name, scope=None):
         scope = scope or self.scope
@@ -93,6 +95,7 @@ class Resolver(ast.NodeVisitor):
 
     def annotation(self, node):
         if node is not None:
+            self.annotation_nodes.update(ast.walk(node))
             for item in ast.walk(node):
                 if isinstance(item, ast.Constant) and isinstance(item.value, str):
                     self.annotation_names.update(re.findall(r'[^\W\d]\w*', item.value))
@@ -100,6 +103,7 @@ class Resolver(ast.NodeVisitor):
 
     def visit_Name(self, node):
         self.names[node] = self.reference(node, node.id)
+        self.name_scopes[node] = self.scope
 
     def visit_FunctionDef(self, node):
         binding = self.reference(node, node.name, 'definition')
@@ -255,13 +259,13 @@ class StripInfoPass(BasePass):
     data. This removes source names, not Python code objects or traceback locations.
     """
 
-    def run(self, context):
+    def run(self, context, *, preserve_names=False, preserve_module_names=False):
         self.context = context
         self.tokens = context.tokens
         self.token_ranges = [(context.source.position(*t.start), context.source.position(*t.end), t) for t in self.tokens]
         self.token_starts = [a for a, _, _ in self.token_ranges]
         edits = self.comments()
-        if uses_reflection(context.tree):
+        if preserve_names or uses_reflection(context.tree):
             return edits
         resolver = Resolver(context)
         try:
@@ -279,7 +283,7 @@ class StripInfoPass(BasePass):
                     exported.update(resolver.root.bindings)
         if any(isinstance(node, ast.Name) and node.id == '__all__' and not isinstance(node.ctx, ast.Store) or isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == '__all__' for node in ast.walk(context.tree)):
             exported.update(resolver.root.bindings)
-        keep_module = any(isinstance(n, ast.Name) and n.id == '__main__' or isinstance(n, ast.alias) and n.name == '__main__' or isinstance(n, ast.ImportFrom) and n.module == '__main__' for n in ast.walk(context.tree))
+        keep_module = preserve_module_names or any(isinstance(n, ast.Name) and n.id == '__main__' or isinstance(n, ast.alias) and n.name == '__main__' or isinstance(n, ast.ImportFrom) and n.module == '__main__' for n in ast.walk(context.tree))
         for b in bindings:
             if b.name.startswith('__') or b.name in resolver.annotation_names or b.scope.table.get_type() == 'class' or any(kind == 'class' for _, kind in b.references) or b.scope is resolver.root and (keep_module or b.name in exported or b.name in class_names):
                 b.keep = True

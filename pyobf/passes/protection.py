@@ -12,12 +12,19 @@ from ..source import SourceDocument
 from .base import PrePass, Replacement
 from .cff import ControlFlowFlatteningPass
 from .junk import JunkCodePass
+from .proxy import BuiltinProxyPass
+from .morph import MorphPass
+from .integrity import IntegrityPass
+from .bcf import BogusControlFlowPass
+from .strip_info import uses_reflection
 
 
 class ProtectionPass(PrePass):
     """Lower paired region macros through reusable AST block passes."""
 
     def run(self, source: SourceDocument) -> Sequence[Replacement]:
+        self.preserve_names = False
+        self.integrity = None
         regions = find_protection_regions(source)
         if not regions:
             return []
@@ -31,7 +38,10 @@ class ProtectionPass(PrePass):
             length = len(source.line_text(marker.row).rstrip("\r\n"))
             edits.append(Replacement(start, start + length, marker.indent + "pass"))
         context = analyze(source.with_text(apply_replacements(source.text, edits)))
+        reflective = uses_reflection(context.tree)
         names = NameAllocator(context.symbols, source.text)
+        if any('integrity' in region.start.options for region in regions):
+            self.integrity = IntegrityPass(names)
         # Pair endpoints must belong to exactly the same AST statement list.
         owners: dict[int, tuple[int, str]] = {}
         for node in ast.walk(context.tree):
@@ -44,9 +54,27 @@ class ProtectionPass(PrePass):
             if owners.get(region.start.row) is None or owners.get(region.start.row) != owners.get(region.end.row):
                 raise marker_error(source, region.end, "protect 시작과 끝은 같은 Python 블록 안에 있어야 합니다")
 
+        proxy_regions = [region for region in regions if "proxy" in region.start.options]
+        proxy = BuiltinProxyPass(context, names) if proxy_regions else None
+        if proxy is not None:
+            # Reflection safety must survive replacing e.g. eval/locals by proxies.
+            self.preserve_names = uses_reflection(context.tree)
+            proxy.transform(context.tree, proxy_regions)
+
         lowered: dict[int, list[ast.stmt]] = {}
-        junk, cff = JunkCodePass(), ControlFlowFlatteningPass()
+        junk, cff, morph = JunkCodePass(), ControlFlowFlatteningPass(), MorphPass()
+        bcf = BogusControlFlowPass()
         scope_types = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        parents = {child: node for node in ast.walk(context.tree) for child in ast.iter_child_nodes(node)}
+
+        def class_namespace(node):
+            while node is not None:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return False
+                if isinstance(node, ast.ClassDef):
+                    return True
+                node = parents.get(node)
+            return False
 
         def visit(node):
             for field, value in ast.iter_fields(node):
@@ -86,10 +114,22 @@ class ProtectionPass(PrePass):
                 if can_docstring and not output and inner and isinstance(inner[0], ast.Expr) and isinstance(inner[0].value, ast.Constant) and isinstance(inner[0].value.value, str):
                     # A region directive before a docstring must not erase __doc__.
                     prefix, inner = [inner[0]], inner[1:]
+                active_proxy = proxy if proxy is not None and not proxy.disabled and any(
+                    outer.start.row <= region.start.row and region.end.row <= outer.end.row for outer in proxy_regions
+                ) else None
+                if "morph" in region.start.options:
+                    inner = morph.run(inner, names, builtin_proxy=active_proxy,
+                                      cff_selected="cff" in region.start.options,
+                                      reflective=reflective, class_scope=class_namespace(owner))
                 if "junk" in region.start.options:
                     inner = junk.run(inner, names)
                 if "cff" in region.start.options:
-                    inner = cff.run(inner, names)
+                    inner = cff.run(inner, names, builtin_proxy=active_proxy,
+                                    morph="morph" in region.start.options and not reflective and not class_namespace(owner))
+                if "bcf" in region.start.options:
+                    inner = bcf.run(inner, names, reflective=reflective, class_scope=class_namespace(owner))
+                if "integrity" in region.start.options:
+                    inner = self.integrity.protect(inner)
                 transformed = prefix + (inner or [ast.Pass()])
                 lowered[region.start.row] = transformed
                 output.extend(transformed)
@@ -113,4 +153,27 @@ class ProtectionPass(PrePass):
             start = source.position(region.start.row, 0)
             end = source.position(region.end.row, 0) + len(source.line_text(region.end.row).rstrip("\r\n"))
             replacements.append(Replacement(start, end, rendered))
+        if proxy is not None and proxy.entries:
+            lowered_source = source.with_text(apply_replacements(source.text, replacements))
+            tree = analyze(lowered_source).tree
+            prefix = []
+            index = 0
+            if tree.body and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant) and isinstance(tree.body[0].value.value, str):
+                prefix.append(tree.body[0])
+                index = 1
+            while index < len(tree.body) and isinstance(tree.body[index], ast.ImportFrom) and tree.body[index].module == "__future__":
+                prefix.append(tree.body[index])
+                index += 1
+            if prefix:
+                insertion = lowered_source.position(prefix[-1].end_lineno, 0) + len(lowered_source.line_text(prefix[-1].end_lineno))
+            else:
+                first = tree.body[0]
+                first_row = min([first.lineno, *(item.lineno for item in getattr(first, "decorator_list", []))])
+                insertion = lowered_source.position(first_row, 0)
+            newline_match = re.search(r"\r\n|\r|\n", source.text)
+            newline = newline_match.group() if newline_match else "\n"
+            header = ast.unparse(ast.fix_missing_locations(ast.Module(body=proxy.definitions(), type_ignores=[]))).replace("\n", newline)
+            separator = newline if insertion and not lowered_source.text[:insertion].endswith(("\n", "\r")) else ""
+            text = lowered_source.text[:insertion] + separator + header + newline + newline + lowered_source.text[insertion:]
+            return [Replacement(0, len(source.text), text)]
         return replacements

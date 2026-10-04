@@ -5,12 +5,13 @@ from pathlib import Path
 from PySide6.QtCore import QStandardPaths
 
 from .themes import THEMES
+from .designs import DESIGNS
 
 
 class SettingsStore:
     def __init__(self, path=None):
         self.path = Path(path) if path is not None else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppConfigLocation)) / "preferences.json"
-        self.data = {"theme": "white", "language": "ko", "recent_files": [], "recent_projects": []}
+        self.data = {"theme": "white", "language": "ko", "design": "studio", "recent_files": [], "recent_projects": []}
         try:
             saved = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(saved, dict):
@@ -18,6 +19,8 @@ class SettingsStore:
                     self.data["theme"] = saved["theme"]
                 if saved.get("language") in ("en", "ko"):
                     self.data["language"] = saved["language"]
+                if saved.get("design") in DESIGNS:
+                    self.data["design"] = saved["design"]
                 for key in ("recent_files", "recent_projects"):
                     if isinstance(saved.get(key), list):
                         self.data[key] = [value for value in saved[key] if isinstance(value, str)][:8]
@@ -30,10 +33,11 @@ class SettingsStore:
         temporary.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
 
-    def preferences(self, theme, language):
-        if theme not in THEMES or language not in ("en", "ko"):
+    def preferences(self, theme, language, design=None):
+        design = self.data["design"] if design is None else design
+        if theme not in THEMES or language not in ("en", "ko") or design not in DESIGNS:
             raise ValueError("Invalid preferences")
-        self.data.update(theme=theme, language=language)
+        self.data.update(theme=theme, language=language, design=design)
         self.save()
 
     def remember(self, kind, path):
